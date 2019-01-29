@@ -191,12 +191,11 @@ class AwsS3Provider extends Provider implements ProviderInterface
         $count = count($assets);
         if ($count > 0) {
             $this->console->writeln('<fg=yellow>Upload in progress......</fg=yellow>');
-            $count--;
             foreach ($assets as $i => $file) {
                 try {
                     $needsCompression = $this->needCompress($file);
                     $this->console->writeln(
-                        '<fg=magenta>' . str_pad( number_format (100 / $count * $i, 2), 6, ' ',STR_PAD_LEFT) . '% </fg=magenta>' .
+                        '<fg=magenta>' . str_pad( number_format (($count / ($i + 1) ) * 100, 2), 6, ' ',STR_PAD_LEFT) . '% </fg=magenta>' .
                         '<fg=cyan>Uploading file path: ' . $file->getRealpath() . '</fg=cyan>' .
                         ($needsCompression ? ' <fg=green>Compressed</fg=green>' : '')
                     );
@@ -214,7 +213,7 @@ class AwsS3Provider extends Provider implements ProviderInterface
                         'CacheControl' => $this->default['providers']['aws']['s3']['cache-control'],
                         'Metadata' => $this->default['providers']['aws']['s3']['metadata'],
                         'Expires' => $this->default['providers']['aws']['s3']['expires'],
-                        'ContentType' => File::mimeType($file->getRealPath()),
+                        'ContentType' => $this->getMimetype($file),
                         'ContentEncoding' => $needsCompression ? $this->compression['algorithm'] : 'identity',
                     ]);
 //                var_dump(get_class($command));exit();
@@ -502,4 +501,20 @@ class AwsS3Provider extends Provider implements ProviderInterface
         }
         return fopen($file->getRealPath(), 'r');
     }
+
+    /**
+     * Get mimetype from config or from system
+     *
+     * @param SplFileInfo $file File info to get mimetype
+     *
+     * @return false|string
+     */
+    protected function getMimetype(SplFileInfo $file) {
+        $ext = '.' . $file->getExtension();
+        if (is_array($this->compression['mimetypes']) && isset($this->compression['mimetypes'][$ext])) {
+            return $this->compression['mimetypes'][$ext];
+        }
+        return File::mimeType($file->getRealPath());
+    }
+
 }
