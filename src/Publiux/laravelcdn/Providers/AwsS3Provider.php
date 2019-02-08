@@ -6,10 +6,13 @@ use Aws\S3\BatchDelete;
 use Aws\S3\Exception\S3Exception;
 use Aws\S3\S3Client;
 use Illuminate\Support\Collection;
+use Illuminate\Support\Facades\File;
+use Illuminate\Support\Facades\Log;
 use Publiux\laravelcdn\Contracts\CdnHelperInterface;
 use Publiux\laravelcdn\Providers\Contracts\ProviderInterface;
 use Publiux\laravelcdn\Validators\Contracts\ProviderValidatorInterface;
 use Symfony\Component\Console\Output\ConsoleOutput;
+use \SplFileInfo;
 
 /**
  * Class AwsS3Provider
@@ -28,7 +31,10 @@ use Symfony\Component\Console\Output\ConsoleOutput;
  * @property string  $acl
  * @property string  $cloudfront
  * @property string  $cloudfront_url
+ * @property string  $use_path_style_endpoint
  * @property string $http
+ * @property array  $compression
+ * @property array  $mimetypes
  *
  * @author   Mahmoud Zalt <mahmoud@vinelab.com>
  */
@@ -43,12 +49,20 @@ class AwsS3Provider extends Provider implements ProviderInterface
     protected $default = [
         'url' => null,
         'threshold' => 10,
+        'compression' => [
+            'extensions' => [],
+            'algorithm' => null,
+            'level' => 9
+        ],
+        'mimetypes' => [
+        ],
         'providers' => [
             'aws' => [
                 's3' => [
                     'version' => null,
                     'region' => null,
                     'endpoint' => null,
+                    'credentials' => null,
                     'buckets' => null,
                     'upload_folder' => '',
                     'http' => null,
@@ -57,6 +71,7 @@ class AwsS3Provider extends Provider implements ProviderInterface
                         'use' => false,
                         'cdn_url' => null,
                     ],
+                    'use_path_style_endpoint' => false
                 ],
             ],
         ],
@@ -67,7 +82,7 @@ class AwsS3Provider extends Provider implements ProviderInterface
      *
      * @var array
      */
-    protected $rules = ['version', 'region', 'key', 'secret', 'buckets', 'url'];
+    protected $rules = ['version', 'region', 'key', 'secret', 'buckets', 'url', 'mimetypes'];
 
     /**
      * this array holds the parsed configuration to be used across the class.
@@ -77,7 +92,7 @@ class AwsS3Provider extends Provider implements ProviderInterface
     protected $supplier;
 
     /**
-     * @var Instance of Aws\S3\S3Client
+     * @var \Aws\S3\S3Client
      */
     protected $s3_client;
 
@@ -135,13 +150,17 @@ class AwsS3Provider extends Provider implements ProviderInterface
             'threshold' => $this->default['threshold'],
             'version' => $this->default['providers']['aws']['s3']['version'],
             'region' => $this->default['providers']['aws']['s3']['region'],
+            'credentials' => $this->default['providers']['aws']['s3']['credentials'],
             'endpoint' => $this->default['providers']['aws']['s3']['endpoint'],
             'buckets' => $this->default['providers']['aws']['s3']['buckets'],
             'acl' => $this->default['providers']['aws']['s3']['acl'],
             'cloudfront' => $this->default['providers']['aws']['s3']['cloudfront']['use'],
             'cloudfront_url' => $this->default['providers']['aws']['s3']['cloudfront']['cdn_url'],
             'http' => $this->default['providers']['aws']['s3']['http'],
-            'upload_folder' => $this->default['providers']['aws']['s3']['upload_folder']
+            'upload_folder' => $this->default['providers']['aws']['s3']['upload_folder'],
+            'use_path_style_endpoint' => $this->default['providers']['aws']['s3']['use_path_style_endpoint'],
+            'compression' => $this->default['compression'],
+            'mimetypes' => $this->default['mimetypes'],
         ];
 
         // check if any required configuration is missed
@@ -171,14 +190,21 @@ class AwsS3Provider extends Provider implements ProviderInterface
         // user terminal message
         $this->console->writeln('<fg=yellow>Comparing local files and bucket...</fg=yellow>');
 
-        $assets = $this->getFilesAlreadyOnBucket($assets);
+        $assets = $this->getFilesToUpload($assets);
 
         // upload each asset file to the CDN
-        if (count($assets) > 0) {
+        $count = count($assets);
+        if ($count > 0) {
             $this->console->writeln('<fg=yellow>Upload in progress......</fg=yellow>');
+            $o = 0;
             foreach ($assets as $file) {
                 try {
-                    $this->console->writeln('<fg=cyan>'.'Uploading file path: '.$file->getRealpath().'</fg=cyan>');
+                    $needsCompression = $this->needCompress($file);
+                    $this->console->writeln(
+                        '<fg=magenta>' . str_pad( number_format (100 / $count * ++$o, 2), 6, ' ',STR_PAD_LEFT) . '% </fg=magenta>' .
+                        '<fg=cyan>Uploading file path: ' . $file->getRealpath() . '</fg=cyan>' .
+                        ($needsCompression ? PHP_EOL. "        <fg=green>Compressed</fg=green>" : '')
+                    );
                     $command = $this->s3_client->getCommand('putObject', [
 
                         // the bucket name
@@ -186,13 +212,15 @@ class AwsS3Provider extends Provider implements ProviderInterface
                         // the path of the file on the server (CDN)
                         'Key' => $this->supplier['upload_folder'] . str_replace('\\', '/', $file->getPathName()),
                         // the path of the path locally
-                        'Body' => fopen($file->getRealPath(), 'r'),
+                        'Body' => $this->getFileContent($file, $needsCompression),
                         // the permission of the file
 
                         'ACL' => $this->acl,
                         'CacheControl' => $this->default['providers']['aws']['s3']['cache-control'],
                         'Metadata' => $this->default['providers']['aws']['s3']['metadata'],
                         'Expires' => $this->default['providers']['aws']['s3']['expires'],
+                        'ContentType' => $this->getMimetype($file),
+                        'ContentEncoding' => $needsCompression ? $this->compression['algorithm'] : 'identity',
                     ]);
 //                var_dump(get_class($command));exit();
 
@@ -223,12 +251,15 @@ class AwsS3Provider extends Provider implements ProviderInterface
     public function connect()
     {
         try {
+            // Parsing credentials
             // Instantiate an S3 client
             $this->setS3Client(new S3Client([
                         'version' => $this->supplier['version'],
                         'region' => $this->supplier['region'],
+                        'credentials' => $this->supplier['credentials'],
                         'endpoint' => $this->supplier['endpoint'],
-                        'http' => $this->supplier['http']
+                        'http' => $this->supplier['http'],
+                        'use_path_style_endpoint' => $this->supplier['use_path_style_endpoint']
                     ]
                 )
             );
@@ -249,45 +280,49 @@ class AwsS3Provider extends Provider implements ProviderInterface
     }
 
     /**
+     * Get files to upload
+     *
      * @param $assets
      * @return mixed
      */
-    private function getFilesAlreadyOnBucket($assets)
+    private function getFilesToUpload(Collection $assets)
     {
-        $filesOnAWS = new Collection([]);
+        $assets_dict = new Collection();
+        foreach ($assets as $item) {
+            $assets_dict->put(str_replace('\\', '/', $item->getPathName()), $item);
+        }
 
-        $files = $this->s3_client->listObjects([
-            'Bucket' => $this->getBucket(),
-        ]);
+        try {
+            $results = $this->s3_client->getPaginator('ListObjects', [
+                'Bucket' => $this->getBucket(),
+            ]);
 
-        if (!$files['Contents']) {
-            //no files on bucket. lets upload everything found.
+            foreach ($results as $result) {
+                foreach ($result['Contents'] as $file) {
+                    $key = $file['Key'];
+                    if (!$assets_dict->has($key)) {
+                        continue;
+                    }
+                    $item = $assets_dict->get($key);
+
+                    if (
+                        !$this->calculateEtag(
+                            $item->getPathName(),
+                            -8,
+                            trim($file['ETag'], '"')
+                        )
+                    ) {
+                        continue;
+                    }
+
+                    $assets_dict->forget($key);
+                }
+            }
+
+            return new Collection($assets_dict->values());
+        } catch (S3Exception $e) {
             return $assets;
         }
-
-        foreach ($files['Contents'] as $file) {
-            $a = [
-                'Key' => $file['Key'],
-                "LastModified" => $file['LastModified']->getTimestamp(),
-                'Size' => $file['Size']
-            ];
-            $filesOnAWS->put($file['Key'], $a);
-        }
-
-        $assets->transform(function ($item, $key) use (&$filesOnAWS) {
-            $fileOnAWS = $filesOnAWS->get(str_replace('\\', '/', $item->getPathName()));
-
-            //select to upload files that are different in size AND last modified time.
-            if (!($item->getMTime() === $fileOnAWS['LastModified']) && !($item->getSize() === $fileOnAWS['Size'])) {
-                return $item;
-            }
-        });
-
-        $assets = $assets->reject(function ($item) {
-            return $item === null;
-        });
-
-        return $assets;
     }
 
     /**
@@ -375,8 +410,21 @@ class AwsS3Provider extends Provider implements ProviderInterface
         $url = $this->cdn_helper->parseUrl($this->getUrl());
 
         $bucket = $this->getBucket();
-        $bucket = (!empty($bucket)) ? $bucket.'.' : '';
 
+        if ($this->supplier['use_path_style_endpoint']) {
+            $bucket = (!empty($bucket)) ? $bucket.'/' : '';
+            if (isset($url['port'])) {
+                $port = (
+                    ($url['scheme'] == 'https' && $url['port'] == 443) ||
+                    ($url['scheme'] == 'http' && $url['port'] == 80)
+                ) ? '' : ':' . $url['port'];
+            } else {
+                $port = '';
+            }
+            return $url['scheme'] . '://' .  $url['host'] . $port . '/' . $bucket . $path;
+        }
+
+        $bucket = (!empty($bucket)) ? $bucket.'.' : '';
         return $url['scheme'] . '://' . $bucket . $url['host'] . '/' . $path;
     }
 
@@ -407,6 +455,92 @@ class AwsS3Provider extends Provider implements ProviderInterface
     {
         return rtrim($this->provider_url, '/') . '/';
     }
+    
+    /**
+     * Calculate Amazon AWS ETag used on the S3 service
+     *
+     * @see https://stackoverflow.com/a/36072294/1762839
+     * @author TheStoryCoder (https://stackoverflow.com/users/2404541/thestorycoder)
+     *
+     * @param string $filename path to file to check
+     * @param int $chunksize chunk size in Megabytes
+     * @param bool|string $expected verify calculated etag against this specified
+     *                              etag and return true or false instead if you make
+     *                              chunksize negative (eg. -8 instead of 8) the function
+     *                              will guess the chunksize by checking all possible sizes
+     *                              given the number of parts mentioned in $expected
+     *
+     * @return bool|string          ETag (string) or boolean true|false if $expected is set
+     */
+    protected function calculateEtag($filename, $chunksize, $expected = false) {
+        if ($chunksize < 0) {
+            $do_guess = true;
+            $chunksize = 0 - $chunksize;
+        } else {
+            $do_guess = false;
+        }
+
+        $fileinfo = new SplFileInfo($filename);
+
+        $chunkbytes = $chunksize*1024*1024;
+        $filesize = $fileinfo->getSize();
+        $needsCompression = $this->needCompress($fileinfo);
+        if ($filesize < $chunkbytes && (!$expected || !preg_match("/^\\w{32}-\\w+$/", $expected))) {
+            $content =  file_get_contents($fileinfo->getRealPath());
+            $return = md5(
+                $needsCompression ? $this->compressContent($content) : $content
+            );
+            if ($expected) {
+                return strtolower($expected) === $return;
+            } else {
+                return $return;
+            }
+        } else {
+            $md5s = array();
+            $handle = fopen($filename, 'rb');
+            if ($handle === false) {
+                return false;
+            }
+            while (!feof($handle)) {
+                $buffer = fread($handle, $chunkbytes);
+                $md5s[] = md5(
+                    $needsCompression ? $this->compressContent($buffer) : $buffer
+                );
+                unset($buffer);
+            }
+            fclose($handle);
+
+            $concat = '';
+            foreach ($md5s as $indx => $md5) {
+                $concat .= hex2bin($md5);
+            }
+            $return = md5($concat) .'-'. count($md5s);
+            if ($expected) {
+                $expected = strtolower($expected);
+                $matches = ($expected === $return ? true : false);
+                if ($matches || $do_guess == false || strlen($expected) == 32) {
+                    return $matches;
+                } else {
+                    // Guess the chunk size
+                    preg_match("/-(\\d+)$/", $expected, $match);
+                    $parts = $match[1];
+                    $min_chunk = ceil($filesize / $parts /1024/1024);
+                    $max_chunk =  floor($filesize / ($parts-1) /1024/1024);
+                    $found_match = false;
+                    for ($i = $min_chunk; $i <= $max_chunk; $i++) {
+                        if ($this->calculateEtag($filename, $i) === $expected) {
+                            $found_match = true;
+                            break;
+                        }
+                    }
+                    return $found_match;
+                }
+            } else {
+                return $return;
+            }
+        }
+    }
+
 
     /**
      * @param $attr
@@ -417,4 +551,77 @@ class AwsS3Provider extends Provider implements ProviderInterface
     {
         return isset($this->supplier[$attr]) ? $this->supplier[$attr] : null;
     }
+
+    /**
+     * Does file needs compression
+     *
+     * @param SplFileInfo $file File info
+     *
+     * @return bool
+     */
+    private function needCompress(SplFileInfo $file) {
+        return !empty($this->compression['algorithm']) &&
+            !empty($this->compression['extensions']) &&
+            in_array($this->compression['algorithm'], ['gzip', 'deflate']) &&
+            in_array('.' . $file->getExtension(), $this->compression['extensions']);
+    }
+
+    /**
+     * Read file content and compress
+     *
+     * @param SplFileInfo $file             File to read
+     * @param bool        $needsCompress    Need file to compress
+     *
+     * @return resource|string
+     */
+    private function getFileContent(SplFileInfo $file, $needsCompress) {
+        if ($needsCompress) {
+            return $this->compressContent(
+                file_get_contents(
+                    $file->getRealPath()
+                )
+            );
+        }
+        return fopen($file->getRealPath(), 'r');
+    }
+
+    /**
+     * Compress file content
+     *
+     * @param string $content Content to compress
+     *
+     * @return string
+     */
+    private function compressContent($content) {
+        switch ($this->compression['algorithm']) {
+            case 'gzip':
+                return gzcompress(
+                    $content,
+                    (int)$this->compression['level'],
+                    ZLIB_ENCODING_GZIP
+                );
+            case 'deflate':
+                return gzcompress(
+                    $content,
+                    (int)$this->compression['level'],
+                    ZLIB_ENCODING_DEFLATE
+                );
+        }
+    }
+
+    /**
+     * Get mimetype from config or from system
+     *
+     * @param SplFileInfo $file File info to get mimetype
+     *
+     * @return false|string
+     */
+    protected function getMimetype(SplFileInfo $file) {
+        $ext = '.' . $file->getExtension();
+        if (isset($this->mimetypes[$ext])) {
+            return $this->mimetypes[$ext];
+        }
+        return File::mimeType($file->getRealPath());
+    }
+
 }
