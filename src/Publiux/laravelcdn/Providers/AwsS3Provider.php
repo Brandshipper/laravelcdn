@@ -7,11 +7,12 @@ use Aws\S3\Exception\S3Exception;
 use Aws\S3\S3Client;
 use Illuminate\Support\Collection;
 use Illuminate\Support\Facades\File;
+use Illuminate\Support\Facades\Log;
 use Publiux\laravelcdn\Contracts\CdnHelperInterface;
 use Publiux\laravelcdn\Providers\Contracts\ProviderInterface;
 use Publiux\laravelcdn\Validators\Contracts\ProviderValidatorInterface;
 use Symfony\Component\Console\Output\ConsoleOutput;
-use Symfony\Component\Finder\SplFileInfo;
+use \SplFileInfo;
 
 /**
  * Class AwsS3Provider
@@ -91,7 +92,7 @@ class AwsS3Provider extends Provider implements ProviderInterface
     protected $supplier;
 
     /**
-     * @var Instance of Aws\S3\S3Client
+     * @var \Aws\S3\S3Client
      */
     protected $s3_client;
 
@@ -454,7 +455,7 @@ class AwsS3Provider extends Provider implements ProviderInterface
     {
         return rtrim($this->provider_url, '/') . '/';
     }
-    
+
     /**
      * Calculate Amazon AWS ETag used on the S3 service
      *
@@ -479,13 +480,18 @@ class AwsS3Provider extends Provider implements ProviderInterface
             $do_guess = false;
         }
 
+        $fileinfo = new SplFileInfo($filename);
+
         $chunkbytes = $chunksize*1024*1024;
-        $filesize = filesize($filename);
+        $filesize = $fileinfo->getSize();
+        $needsCompression = $this->needCompress($fileinfo);
         if ($filesize < $chunkbytes && (!$expected || !preg_match("/^\\w{32}-\\w+$/", $expected))) {
-            $return = md5_file($filename);
+            $content =  file_get_contents($fileinfo->getRealPath());
+            $return = md5(
+                $needsCompression ? $this->compressContent($content) : $content
+            );
             if ($expected) {
-                $expected = strtolower($expected);
-                return ($expected === $return ? true : false);
+                return strtolower($expected) === $return;
             } else {
                 return $return;
             }
@@ -497,7 +503,9 @@ class AwsS3Provider extends Provider implements ProviderInterface
             }
             while (!feof($handle)) {
                 $buffer = fread($handle, $chunkbytes);
-                $md5s[] = md5($buffer);
+                $md5s[] = md5(
+                    $needsCompression ? $this->compressContent($buffer) : $buffer
+                );
                 unset($buffer);
             }
             fclose($handle);
@@ -568,26 +576,37 @@ class AwsS3Provider extends Provider implements ProviderInterface
      */
     private function getFileContent(SplFileInfo $file, $needsCompress) {
         if ($needsCompress) {
-            switch ($this->compression['algorithm']) {
-                case 'gzip':
-                    return gzcompress(
-                        file_get_contents(
-                            $file->getRealPath()
-                        ),
-                        (int)$this->compression['level'],
-                        ZLIB_ENCODING_GZIP
-                    );
-                case 'deflate':
-                    return gzcompress(
-                        file_get_contents(
-                            $file->getRealPath()
-                        ),
-                        (int)$this->compression['level'],
-                        ZLIB_ENCODING_DEFLATE
-                    );
-            }
+            return $this->compressContent(
+                file_get_contents(
+                    $file->getRealPath()
+                )
+            );
         }
         return fopen($file->getRealPath(), 'r');
+    }
+
+    /**
+     * Compress file content
+     *
+     * @param string $content Content to compress
+     *
+     * @return string
+     */
+    private function compressContent($content) {
+        switch ($this->compression['algorithm']) {
+            case 'gzip':
+                return gzcompress(
+                    $content,
+                    (int)$this->compression['level'],
+                    ZLIB_ENCODING_GZIP
+                );
+            case 'deflate':
+                return gzcompress(
+                    $content,
+                    (int)$this->compression['level'],
+                    ZLIB_ENCODING_DEFLATE
+                );
+        }
     }
 
     /**
